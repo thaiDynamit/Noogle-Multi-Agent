@@ -8,7 +8,7 @@ import time
 
 # --- Configuration ---
 OMDB_API_KEY = os.environ.get('OMDB_API_KEY', 'd4d83b58') # YOUR OMDb API KEY IS NOW HERE
-OMDB_BASE_URL = "http://www.omdbapi.com/"
+OMDB_BASE_URL = "https://www.omdbapi.com/"
 AUTO_SUMMARY_MOVIE_THRESHOLD = 3
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" 
 
