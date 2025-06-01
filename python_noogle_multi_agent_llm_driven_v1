@@ -1,0 +1,522 @@
+import re
+import statistics
+import requests
+import os
+import textwrap
+import json 
+import time 
+
+# --- Configuration ---
+OMDB_API_KEY = os.environ.get('OMDB_API_KEY', 'd4d83b58') # YOUR OMDb API KEY IS NOW HERE
+OMDB_BASE_URL = "http://www.omdbapi.com/"
+AUTO_SUMMARY_MOVIE_THRESHOLD = 3
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" 
+
+# --- Base Worker Agent ---
+class WorkerAgent:
+    def get_name(self):
+        return self.__class__.__name__
+
+    def get_description_for_llm(self) -> dict:
+        raise NotImplementedError("Worker agents must implement 'get_description_for_llm'.")
+
+    def execute(self, task_details: dict, previous_results: dict = None, conversation_history: list = None) -> dict:
+        raise NotImplementedError("Worker agents must implement the 'execute' method.")
+
+# --- Worker Agent Implementations ---
+class MovieDataWorker(WorkerAgent): # Now using OMDb
+    def get_description_for_llm(self) -> dict:
+        return {
+            "name": "movie_data_fetcher",
+            "description": "Fetches movie information from OMDb. Best used for looking up specific movie titles. Can also perform a general search for a term which might return multiple movies (less detailed). Provides details like year, plot, actors, box office (usually US domestic), and ratings including Rotten Tomatoes if available.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "movie_title_query": {"type": "string", "description": "The specific title of the movie to search for (e.g., 'The Matrix'). This is the preferred method for detailed info."},
+                    "general_search_term": {"type": "string", "description": "A general term to search for (e.g., 'Keanu Reeves' or 'Matrix'). This returns a list of matching titles, usually less detailed than a specific title query."},
+                    "year_after_filter": {"type": "integer", "description": "(Optional) If filtering a list of movies from a general search, only include movies released after this year.", "nullable": True},
+                    "min_gross_filter": {"type": "integer", "description": "(Optional) If filtering a list of movies, only include movies with BoxOffice (US) greater than this amount.", "nullable": True}
+                }
+            }
+        }
+
+    def _parse_omdb_movie_data(self, omdb_data: dict) -> dict | None:
+        if not omdb_data or omdb_data.get("Response") == "False":
+            return None
+
+        box_office_str = omdb_data.get("BoxOffice", "N/A").replace("$", "").replace(",", "")
+        worldwide_gross_usd = None
+        try:
+            worldwide_gross_usd = int(box_office_str)
+        except ValueError:
+            worldwide_gross_usd = 0 
+
+        rt_score = None
+        ratings = omdb_data.get("Ratings", [])
+        for rating_source in ratings:
+            if rating_source.get("Source") == "Rotten Tomatoes":
+                try:
+                    rt_score = int(rating_source.get("Value", "").replace("%", ""))
+                except ValueError:
+                    rt_score = None
+                break
+        
+        year = None
+        try:
+            year_str = omdb_data.get("Year","0000")
+            year_match = re.match(r"(\d{4})", year_str) 
+            if year_match:
+                year = int(year_match.group(1))
+        except: pass
+
+
+        return {
+            "title": omdb_data.get("Title"),
+            "year": year,
+            "worldwide_gross_usd": worldwide_gross_usd, 
+            "rotten_tomatoes_proxy": rt_score,
+            "imdb_id": omdb_data.get("imdbID"),
+            "plot": omdb_data.get("Plot"),
+            "actors": omdb_data.get("Actors"),
+            "director": omdb_data.get("Director")
+        }
+
+    def execute(self, task_details: dict, previous_results: dict = None, conversation_history: list = None) -> dict:
+        movie_title_query = task_details.get("movie_title_query")
+        general_search_term = task_details.get("general_search_term")
+        year_after_filter = task_details.get("year_after_filter")
+        min_gross_filter = task_details.get("min_gross_filter")
+
+        print(f"--- [{self.get_name()} with OMDb] Executing with details: {task_details} ---")
+        if OMDB_API_KEY == 'YOUR_OMDB_API_KEY': 
+            print(f"--- [{self.get_name()}] CRITICAL ERROR: OMDB_API_KEY is still the placeholder 'YOUR_OMDB_API_KEY'. ---")
+            return {"error": "OMDB API Key is placeholder. Please replace it."}
+
+
+        params = {"apikey": OMDB_API_KEY}
+        movies_data_list = []
+
+        try:
+            if movie_title_query:
+                params["t"] = movie_title_query
+                params["plot"] = "full" 
+                response = requests.get(OMDB_BASE_URL, params=params)
+                response.raise_for_status()
+                data = response.json()
+                parsed_movie = self._parse_omdb_movie_data(data)
+                if parsed_movie:
+                    movies_data_list.append(parsed_movie)
+                elif data.get("Error"):
+                     return {"movies": [], "message": f"OMDb: {data.get('Error')} for title '{movie_title_query}'."}
+
+            elif general_search_term:
+                params["s"] = general_search_term
+                response = requests.get(OMDB_BASE_URL, params=params)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("Response") == "True" and "Search" in data:
+                    search_results = data["Search"]
+                    print(f"--- [{self.get_name()}] General search for '{general_search_term}' found {len(search_results)} potential titles. Fetching details... ---")
+                    for movie_stub in search_results[:5]: 
+                        if movie_stub.get("imdbID"):
+                            detail_params = {"apikey": OMDB_API_KEY, "i": movie_stub["imdbID"], "plot": "full"}
+                            detail_response = requests.get(OMDB_BASE_URL, params=detail_params)
+                            if detail_response.status_code == 200:
+                                detail_data = detail_response.json()
+                                parsed_movie = self._parse_omdb_movie_data(detail_data)
+                                if parsed_movie:
+                                    movies_data_list.append(parsed_movie)
+                            else:
+                                print(f"--- [{self.get_name()}] Error fetching details for IMDb ID {movie_stub['imdbID']}: Status {detail_response.status_code} ---")
+                elif data.get("Error"):
+                    return {"movies": [], "message": f"OMDb: {data.get('Error')} for search term '{general_search_term}'."}
+            else:
+                return {"error": "MovieDataWorker: Movie title or general search term is required for OMDb."}
+
+            final_filtered_movies = []
+            if movies_data_list:
+                for movie in movies_data_list:
+                    passes_filter = True
+                    if year_after_filter is not None and movie.get("year") is not None:
+                        if movie["year"] <= year_after_filter:
+                            passes_filter = False
+                    if min_gross_filter is not None and movie.get("worldwide_gross_usd") is not None: 
+                        if movie["worldwide_gross_usd"] <= min_gross_filter:
+                            passes_filter = False
+                    if passes_filter:
+                        final_filtered_movies.append(movie)
+            
+            if not final_filtered_movies and (movie_title_query or general_search_term) and movies_data_list: 
+                return {"movies": [], "message": "Found movies but none matched all filter criteria (year/gross)."}
+
+            return {"movies": final_filtered_movies}
+
+        except requests.exceptions.RequestException as e:
+            return {"error": f"OMDb API request error: {e}"} # This is the error you are seeing
+        except ValueError as e: 
+            return {"error": f"Error decoding OMDb API JSON response: {e}"}
+        except Exception as e:
+            return {"error": f"Unexpected error in MovieDataWorker: {e}"}
+
+# --- Other Workers (DataCalculationWorker, SummarizationWorker, GeneralSearchWorker, NewsSearchWorker) ---
+# These remain the same as the version where they were last fully defined.
+# For brevity, only showing their class definition and get_description_for_llm
+class DataCalculationWorker(WorkerAgent): 
+    def get_description_for_llm(self) -> dict: return {"name":"calculator", "description":"Calculates average Rotten Tomatoes score (proxy) from a list of movies.", "parameters":{"type":"object", "properties":{"calculation_type":{"type":"string", "enum":["average_rt_score"]}, "movies_data":{"type":"array", "description":"List of movie objects with 'rotten_tomatoes_proxy'.", "items":{"type":"object", "properties":{"rotten_tomatoes_proxy":{"type":"number"}}}}}, "required":["calculation_type", "movies_data"]}}
+    def execute(self, task_details: dict, previous_results: dict = None, conversation_history: list = None) -> dict:
+        print(f"--- [{self.get_name()}] Executing: {task_details} ---")
+        movies_data = task_details.get("movies_data", [])
+        if not movies_data: return {"average_score": None, "count": 0, "error": "No movie data."}
+        scores = [m.get("rotten_tomatoes_proxy") for m in movies_data if m.get("rotten_tomatoes_proxy") is not None]
+        if not scores: return {"average_score": None, "count": 0, "message": "No valid scores."}
+        return {"average_score": round(statistics.mean(scores), 1), "count": len(scores)}
+
+class SummarizationWorker(WorkerAgent): 
+    def get_description_for_llm(self) -> dict: return {"name":"summarizer", "description":"Summarizes text or movie overviews.", "parameters":{"type":"object", "properties":{"text_to_summarize":{"type":"string"}, "movies_data":{"type":"array", "items":{"type":"object", "properties":{"overview":{"type":"string"}}}}}}}
+    def execute(self, task_details: dict, previous_results: dict = None, conversation_history: list = None) -> dict:
+        print(f"--- [{self.get_name()}] Executing: {task_details} ---")
+        text_to_summarize = task_details.get("text_to_summarize", ""); movies_data = task_details.get("movies_data", [])
+        if movies_data:
+            overviews = [m.get("overview","").strip() for m in movies_data if m.get("overview","").strip()]
+            if overviews: text_to_summarize = " ".join(overviews)
+            else: return {"summary": "", "message": "No overviews to summarize."}
+        if not text_to_summarize.strip(): return {"summary": "", "error": "No text for summarization."}
+        return {"summary": textwrap.shorten(text_to_summarize, width=250, placeholder="...")}
+
+class GeneralSearchWorker(WorkerAgent): 
+    def get_description_for_llm(self) -> dict: return {"name":"general_searcher", "description":"Performs a general simulated web search. Fallback for ambiguous terms or topics not covered by other tools.", "parameters":{"type":"object", "properties":{"query":{"type":"string"}}, "required":["query"]}}
+    def execute(self, task_details: dict, previous_results: dict = None, conversation_history: list = None) -> dict:
+        query = task_details.get("query"); print(f"--- [{self.get_name()}] Simulating search for: '{query}' ---")
+        if not query: return {"error":"No query."}
+        if "matrix" in query.lower() and "math" in query.lower(): return {"search_snippet": "A matrix in math is a rectangular array."}
+        return {"search_snippet": f"General OMDb/Web search for '{query}' found various related topics."} 
+
+class NewsSearchWorker(WorkerAgent): 
+    def get_description_for_llm(self) -> dict:
+        return {
+            "name": "news_searcher",
+            "description": "Fetches recent (simulated) news articles about a specific topic, actor, or movie.",
+            "parameters": {
+                "type": "object",
+                "properties": {"search_term": {"type": "string", "description": "The topic, actor, or movie to search news for."}},
+                "required": ["search_term"]
+            }
+        }
+    def execute(self, task_details: dict, previous_results: dict = None, conversation_history: list = None) -> dict:
+        search_term = task_details.get("search_term", "").lower()
+        print(f"--- [{self.get_name()}] Searching news for: '{search_term}' ---")
+        mock_news_db = {
+            "keanu reeves": [{"title": "Keanu Reeves Honored", "snippet": "Keanu received an award...", "source": "SimuNews", "date": "2025-05-30"}],
+            "the matrix resurrections": [{"title": "Matrix Resurrections Themes", "snippet": "Critics discuss the narrative...", "source": "FilmBuff", "date": "2025-05-25"}]
+        }
+        if search_term in mock_news_db: return {"news_articles": mock_news_db[search_term]}
+        return {"news_articles": [], "message": f"No recent news for '{task_details.get('search_term')}'."}
+
+class ResponseFormattingWorker(WorkerAgent):
+    def get_description_for_llm(self) -> dict:
+        return { "name": "response_formatter", "description": "Formats the final response based on all gathered information.",
+            "parameters": { "type": "object", "properties": {
+                    "original_prompt_details": {"type": "object"},
+                    "fetched_movies_result": {"type": "object", "nullable": True},
+                    "average_rt_result": {"type": "object", "nullable": True},
+                    "summarized_movie_data": {"type": "object", "nullable": True},
+                    "general_search_result": {"type": "object", "nullable": True},
+                    "news_search_result": {"type": "object", "nullable": True}, 
+                    "clarification_question": {"type": "string", "nullable": True},
+                    "error_message_to_format": {"type": "string", "nullable": True}
+                }, "required": ["original_prompt_details"]
+            }
+        }
+    def execute(self, task_details: dict, previous_results: dict = None, conversation_history: list = None) -> dict:
+        print(f"--- [{self.get_name()}] Formatting with OMDb data: {str(task_details)[:500]}... ---")
+        
+        if task_details.get("clarification_question"):
+            return {"formatted_response": task_details["clarification_question"], "needs_clarification": True}
+        if task_details.get("error_message_to_format"):
+             return {"formatted_response": f"Noogle encountered an issue: {task_details['error_message_to_format']}"}
+
+        parsed_info = task_details.get("original_prompt_details", {})
+        # Ensure we safely access nested results
+        movies_res = task_details.get("fetched_movies_result") if isinstance(task_details.get("fetched_movies_result"), dict) else {}
+        avg_rt_res = task_details.get("average_rt_result") if isinstance(task_details.get("average_rt_result"), dict) else {}
+        summary_res = task_details.get("summarized_movie_data") if isinstance(task_details.get("summarized_movie_data"), dict) else {}
+        general_search_res = task_details.get("general_search_result") if isinstance(task_details.get("general_search_result"), dict) else {}
+        news_res = task_details.get("news_search_result") if isinstance(task_details.get("news_search_result"), dict) else {}
+        
+        parts = []
+        actor_queried = parsed_info.get('actor', 'your query')
+        movie_title_queried = parsed_info.get('movie_title_query', actor_queried)
+        
+        # Handle Movie Data or its error
+        if movies_res.get("error"):
+            parts.append(f"Movie search error: {movies_res['error']}")
+        elif movies_res.get("movies") and isinstance(movies_res.get("movies"), list) and len(movies_res.get("movies")) > 0 :
+            parts.append(f"OMDb found {len(movies_res['movies'])} movie(s) related to '{movie_title_queried}':")
+            for m in movies_res["movies"][:5]: 
+                parts.append(f"  - {m.get('title','N/A')} ({m.get('year','N/A')}), BoxOffice: ${m.get('worldwide_gross_usd',0):,}, RT Proxy: {m.get('rotten_tomatoes_proxy','N/A')}%")
+                if m.get('plot'): parts.append(f"    Plot: {textwrap.shorten(m['plot'], width=100, placeholder='...')}")
+        elif movies_res.get("message"): 
+             parts.append(movies_res.get("message"))
+        elif general_search_res.get("search_snippet"): # Fallback to general search if no movie data/error
+            parts.append(f"General Info: {general_search_res['search_snippet']}")
+        # else: # Avoid generic "no movie data" if other sections will have info
+            # if not (news_res.get("news_articles") or general_search_res.get("search_snippet")):
+            #    parts.append("No specific movie data found based on your criteria.")
+
+        # Handle News Data
+        if news_res.get("error"):
+            if parts: parts.append("") # Add a newline
+            parts.append(f"News search error: {news_res['error']}")
+        elif news_res.get("news_articles") and len(news_res.get("news_articles")) > 0:
+            if parts: parts.append("") 
+            parts.append("Recent News:")
+            for article in news_res["news_articles"][:3]: 
+                parts.append(f"  - {article['title']} ({article.get('source','N/A')}, {article.get('date','N/A')}): {article.get('snippet','')[:100]}...")
+        elif news_res.get("message"):
+             if parts: parts.append("")
+             parts.append(f"News: {news_res.get('message')}")
+
+        # Handle Average RT Score
+        if avg_rt_res.get("error"):
+            if parts: parts.append("")
+            parts.append(f"Could not calculate average score: {avg_rt_res['error']}")
+        elif avg_rt_res.get("average_score") is not None: 
+            if parts: parts.append("")
+            parts.append(f"Average RT Proxy for listed movies: {avg_rt_res['average_score']}% (from {avg_rt_res.get('count',0)} movies)")
+        elif avg_rt_res.get("message"):
+             if parts: parts.append("")
+             parts.append(f"Note on average score: {avg_rt_res.get('message')}")
+
+        # Handle Summary
+        if summary_res.get("error"):
+            if parts: parts.append("")
+            parts.append(f"Could not generate summary: {summary_res['error']}")
+        elif summary_res.get("summary"): 
+            if parts: parts.append("")
+            parts.append(f"Summary: {summary_res['summary']}")
+        elif summary_res.get("message"):
+             if parts: parts.append("")
+             parts.append(f"Note on summary: {summary_res.get('message')}")
+        
+        return {"formatted_response": "\n".join(parts) if parts else "Noogle (OMDb) processed your request, but no specific details were found or generated."}
+
+# --- Supervisor Agent ---
+class SupervisorNoogleAgent:
+    # ... (Constructor and _get_tool_descriptions_for_llm remain the same as previous version) ...
+    def __init__(self):
+        self.conversation_history = []
+        self.workers = {
+            "movie_data_fetcher": MovieDataWorker(),
+            "calculator": DataCalculationWorker(),
+            "summarizer": SummarizationWorker(),
+            "general_searcher": GeneralSearchWorker(), 
+            "news_searcher": NewsSearchWorker(),
+            "response_formatter": ResponseFormattingWorker()
+        }
+        self.agent_status = "idle" 
+        self.clarification_context = None 
+        self.max_llm_calls_per_request = 5 
+        print("--- SupervisorNoogleAgent Initialized (OMDb + LLM-Sim + News - Robust Formatter) ---")
+
+    def _get_tool_descriptions_for_llm(self):
+        return [worker.get_description_for_llm() for worker in self.workers.values()]
+
+    async def _call_llm_for_plan(self, current_input_for_llm: str, agent_state_for_llm: dict) -> dict | None:
+        # ... (LLM call logic and SIMULATED RESPONSES from previous version) ...
+        tool_descriptions_json = json.dumps(self._get_tool_descriptions_for_llm(), indent=2)
+        history_json = json.dumps(self.conversation_history[-5:], indent=2)
+        current_results_json = json.dumps(agent_state_for_llm.get("completed_steps_results",{}), indent=2, default=str)
+
+        system_prompt = f"""You are "Noogle", a helpful movie and news information agent using OMDb.
+Your goal: understand user requests, use tools to gather info, provide comprehensive answers.
+OMDb is best for specific movie title lookups. For general actor searches (using 'general_search_term' in movie_data_fetcher), it might return a list that needs further processing or individual title lookups by you if the user asks for more details on one.
+Filtering by year or gross on OMDb data happens *after* fetching by the movie_data_fetcher worker.
+
+Available tools:
+{tool_descriptions_json}
+
+Conversation history (last 5 turns): {history_json} 
+Current request state: Original prompt: "{agent_state_for_llm.get('original_prompt')}", Results so far: {current_results_json}
+Clarification context: {json.dumps(self.clarification_context, indent=2) if self.agent_status == 'awaiting_clarification' else 'None'}
+
+Based on LATEST user input: "{current_input_for_llm}" AND all context, decide NEXT SINGLE ACTION.
+Respond ONLY in JSON: {{"thought": "...", "action": "tool_name/special_action", "action_input": {{...}}, "is_final_step_for_now": boolean}}
+Special actions: "ask_clarification", "final_response_ready".
+For 'movie_data_fetcher', prioritize 'movie_title_query' if a specific title is mentioned. Use 'general_search_term' for broader actor/topic searches related to movies.
+For 'final_response_ready', the 'action_input' should be for 'response_formatter' and include all relevant keys like 'original_prompt_details', 'fetched_movies_result', 'average_rt_result', etc., even if their values are null or error objects from previous steps.
+"""
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": system_prompt}]}],
+            "generationConfig": { "responseMimeType": "application/json", "temperature": 0.2, 
+                                 "responseSchema": { "type": "object", "properties": {
+                                        "thought": {"type": "string"}, "action": {"type": "string"},
+                                        "action_input": {"type": "object", "nullable": True},
+                                        "clarification_question": {"type": "string", "nullable": True},
+                                        "clarification_options": {"type": "array", "items": {"type": "object"}, "nullable": True},
+                                        "is_final_step_for_now": {"type": "boolean"}
+                                    }, "required": ["thought", "action", "is_final_step_for_now"] }
+            }
+        }
+        print(f"--- Sending OMDb-aware payload to Gemini (prompt length: {len(system_prompt)} chars) ---")
+        try:
+            # --- SIMULATED LLM RESPONSE FOR TESTING ---
+            time.sleep(0.1) 
+            simulated_response_data = {}
+            latest_input_lower = current_input_for_llm.lower()
+            completed_results = agent_state_for_llm.get("completed_steps_results",{})
+            
+            # Handle error from movie_data_fetcher if it occurred
+            if completed_results.get("fetched_movies", {}).get("error"):
+                 simulated_response_data = {
+                    "thought": "Movie data fetcher failed. Proceeding to format the error response.",
+                    "action": "final_response_ready",
+                    "action_input": { "original_prompt_details": agent_state_for_llm, "fetched_movies_result": completed_results.get("fetched_movies") },
+                    "is_final_step_for_now": True
+                }
+            elif "news about keanu reeves" in latest_input_lower and not completed_results.get("news_search_result"):
+                simulated_response_data = {"thought": "User wants news about Keanu. Using news_searcher.", "action": "news_searcher", "action_input": {"search_term": "Keanu Reeves"}, "is_final_step_for_now": False}
+            elif ("keanu reeves" in latest_input_lower and "after 2010" in latest_input_lower) and not completed_results.get("fetched_movies") :
+                min_gross_sim = 10000000 # Example from user prompt
+                simulated_response_data = {"thought": "User wants Keanu movies. Using movie_data_fetcher (general search).", "action": "movie_data_fetcher", "action_input": { "general_search_term": "Keanu Reeves", "year_after_filter": 2010, "min_gross_filter": min_gross_sim }, "is_final_step_for_now": False }
+            elif "the matrix" in latest_input_lower and not completed_results.get("fetched_movies"):
+                 simulated_response_data = {"thought": "User wants 'The Matrix'. Using movie_data_fetcher (title search).", "action": "movie_data_fetcher", "action_input": {"movie_title_query": "The Matrix"}, "is_final_step_for_now": False}
+            elif completed_results.get("fetched_movies") and \
+                 (agent_state_for_llm.get("original_prompt_details",{}).get("wants_average_rt") or "average" in latest_input_lower) and \
+                 not completed_results.get("average_rt_result"):
+                simulated_response_data = {"thought": "Movies fetched, user wants average. Using calculator.", "action": "calculator", "action_input": {"calculation_type": "average_rt_score", "movies_data": completed_results.get("fetched_movies",{}).get("movies",[])}, "is_final_step_for_now": False}
+            else: 
+                 simulated_response_data = {
+                    "thought": "Defaulting to format response with all available data.", "action": "final_response_ready", 
+                    "action_input": { "original_prompt_details": agent_state_for_llm, **completed_results }, 
+                    "is_final_step_for_now": True}
+            print(f"--- [Supervisor LLM Call] SIMULATED LLM JSON Response: {json.dumps(simulated_response_data, indent=2)} ---")
+            return simulated_response_data
+        except Exception as e: print(f"--- [Supervisor LLM Call] Error: {e} ---")
+        return None
+
+    async def handle_request(self, user_prompt: str) -> str:
+        # ... (The core loop from the LLM-driven agent v1 remains largely the same)
+        # Key is that the LLM now receives more structured tool descriptions and
+        # the MovieDataWorker behaves according to OMDb logic.
+        print(f"\n>>> [SupervisorNoogle Request]: {user_prompt}")
+        
+        if self.agent_status != "awaiting_clarification":
+            self.conversation_history.append({"role": "user", "content": user_prompt})
+            self.current_agent_state = {
+                "original_prompt": user_prompt, "parsed_entities": {}, # For LLM to potentially populate
+                "completed_steps_results": {}, "llm_call_count": 0,
+                # These flags are now more for the formatter, LLM should infer intent
+                "original_prompt_details": {"wants_average_rt": "average" in user_prompt.lower() or "score" in user_prompt.lower(),
+                                            "wants_summary": "summary" in user_prompt.lower() or "summarize" in user_prompt.lower()}
+            }
+        else: 
+            self.conversation_history.append({"role": "user", "content": f"[Clarification] {user_prompt}"})
+            self.agent_status = "idle" # Reset status, LLM will decide if clarification was sufficient
+        
+        final_response_str = "Noogle is processing (OMDb)..." # Default message
+        
+        while self.current_agent_state["llm_call_count"] < self.max_llm_calls_per_request:
+            self.current_agent_state["llm_call_count"] += 1
+            print(f"\n--- Supervisor LLM Cycle {self.current_agent_state['llm_call_count']} (OMDb) ---")
+            
+            # Pass current user_prompt for LLM to decide based on latest input and history
+            llm_decision = await self._call_llm_for_plan(user_prompt, self.current_agent_state) 
+            
+            if not llm_decision: 
+                final_response_str = "LLM communication error or invalid plan."; break
+            
+            print(f"--- [Supervisor LLM Decision]: Action='{llm_decision.get('action')}', Thought='{llm_decision.get('thought')}' ---")
+            self.conversation_history.append({"role": "noogle_supervisor_thought", "content": llm_decision.get('thought')})
+            
+            action = llm_decision.get("action")
+            action_input = llm_decision.get("action_input", {})
+            is_final = llm_decision.get("is_final_step_for_now", False)
+            observation = None
+
+            if action == "ask_clarification": 
+                # LLM decided to ask for clarification.
+                # The action_input for formatter should contain clarification_question.
+                formatter = self.workers["response_formatter"]
+                # Ensure action_input for formatter has original_prompt_details
+                fmt_input = {"original_prompt_details": self.current_agent_state.get("original_prompt_details", self.current_agent_state), 
+                             "clarification_question": llm_decision.get("clarification_question"),
+                             "ask_clarification": True}
+                if llm_decision.get("clarification_options"): # Pass options if LLM provides them
+                    fmt_input["original_prompt_details"]["clarification_options"] = llm_decision.get("clarification_options")
+                    fmt_input["original_prompt_details"]["ambiguous_term_original"] = "the ambiguous term" # LLM should ideally provide this
+
+                obs = formatter.execute(fmt_input, self.current_agent_state["completed_steps_results"], self.conversation_history)
+                final_response_str = obs.get("formatted_response", "Noogle needs clarification, but had trouble asking."); is_final = True
+                if obs.get("needs_clarification"): self.agent_status = "awaiting_clarification"; self.clarification_context = {"original_prompt": self.current_agent_state["original_prompt"], "options": llm_decision.get("clarification_options", [])}
+            elif action == "final_response_ready":
+                formatter = self.workers["response_formatter"]
+                # Ensure original_prompt_details is passed to formatter from agent_state
+                current_action_input = {"original_prompt_details": self.current_agent_state, **self.current_agent_state["completed_steps_results"]}
+                if isinstance(action_input, dict): # Merge LLM provided action_input
+                    current_action_input.update(action_input)
+
+                obs = formatter.execute(current_action_input, self.current_agent_state["completed_steps_results"], self.conversation_history)
+                final_response_str = obs.get("formatted_response", "Error in final formatting."); is_final = True
+            elif action in self.workers:
+                worker = self.workers[action]; print(f"--- [Supervisor] Action: Delegating to '{action}' ---")
+                try:
+                    observation = worker.execute(action_input, self.current_agent_state["completed_steps_results"], self.conversation_history)
+                    output_key = action + "_result" # Default
+                    # More specific keys for easier access by LLM in next turn or by formatter
+                    if action == "movie_data_fetcher": output_key = "fetched_movies_result"
+                    elif action == "calculator": output_key = "average_rt_result"
+                    elif action == "summarizer": output_key = "summarized_movie_data"
+                    elif action == "general_searcher": output_key = "general_search_result"
+                    elif action == "news_searcher": output_key = "news_search_result" 
+                    
+                    self.current_agent_state["completed_steps_results"][output_key] = observation
+                    self.conversation_history.append({"role": "noogle_worker_observation", "content": f"Tool: {action}, Result: {str(observation)[:150]}..."})
+                    if observation.get("error"): print(f"--- [Supervisor] Worker '{action}' error: {observation['error']}. ---")
+                except Exception as e: 
+                    observation = {"error": str(e)}
+                    self.current_agent_state["completed_steps_results"][action + "_error"] = observation
+            else: 
+                final_response_str = f"Unknown action from LLM: {action}."; is_final = True
+            
+            if is_final: break # Exit while loop if LLM indicates it's a final step for this turn
+        
+        # Fallback formatting if loop finishes due to max calls or other reasons without hitting formatter via LLM
+        if self.agent_status != "awaiting_clarification" and (not final_response_str or final_response_str == "Noogle is processing (OMDb)..."):
+            if self.current_agent_state["llm_call_count"] >= self.max_llm_calls_per_request :
+                final_response_str = "Noogle took too many processing steps. Please try rephrasing."
+            else: 
+                formatter = self.workers["response_formatter"]
+                action_input_for_formatter = {"original_prompt_details": self.current_agent_state, **self.current_agent_state["completed_steps_results"]}
+                obs = formatter.execute(action_input_for_formatter, self.current_agent_state["completed_steps_results"], self.conversation_history)
+                final_response_str = obs.get("formatted_response", "Noogle encountered an issue in the final processing stage.")
+        
+        print(f"\n<<< [SupervisorNoogle Final Response (OMDb)]:\n{final_response_str}")
+        if self.agent_status != "awaiting_clarification": # Only add final response to history if not waiting
+            self.conversation_history.append({"role": "noogle_supervisor", "content": final_response_str, "results_context": self.current_agent_state["completed_steps_results"]})
+        return final_response_str
+
+# --- Example Usage (Async Wrapper) ---
+async def main():
+    noogle_supervisor = SupervisorNoogleAgent()
+    
+    if OMDB_API_KEY == 'YOUR_OMDB_API_KEY': 
+        print("\n" + "*"*60 + "\nIMPORTANT: OMDB_API_KEY is 'YOUR_OMDB_API_KEY'. Please replace it with your actual key for OMDb functionality.\nLimited simulated responses will be used.\n" + "*"*60 + "\n")
+
+    print("--- Test Case 1: Keanu Reeves movies (OMDb) ---")
+    prompt1 = "Noogle, find out which movies starring Keanu Reeves released after 2010 grossed over $10 million worldwide AND tell me their average Rotten Tomatoes score!"
+    await noogle_supervisor.handle_request(prompt1)
+    
+    print("\n" + "="*70 + "\n")
+    print("--- Test Case 2: Specific Movie Title (OMDb) ---")
+    prompt2 = "Noogle, tell me about the movie The Matrix and its Rotten Tomatoes score."
+    await noogle_supervisor.handle_request(prompt2)
+
+    print("\n" + "="*70 + "\n")
+    print("--- Test Case 3: News about Keanu ---")
+    prompt3 = "Noogle, any news about Keanu Reeves?"
+    await noogle_supervisor.handle_request(prompt3)
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
