@@ -105,9 +105,12 @@ class MovieDataWorker(WorkerAgent): # Now using OMDb
                 data = response.json()
                 parsed_movie = self._parse_omdb_movie_data(data)
                 if parsed_movie:
+                    print(f"--- [MovieDataWorker] Parsed Movie Data: ---\n{json.dumps(parsed_movie, indent=2)}")
                     movies_data_list.append(parsed_movie)
                 elif data.get("Error"):
-                     return {"movies": [], "message": f"OMDb: {data.get('Error')} for title '{movie_title_query}'."}
+                     result_dict = {"movies": [], "message": f"OMDb: {data.get('Error')} for title '{movie_title_query}'."}
+                     print(f"--- [MovieDataWorker] Returning message: {result_dict['message']} ---")
+                     return result_dict
 
             elif general_search_term:
                 params["s"] = general_search_term
@@ -125,13 +128,18 @@ class MovieDataWorker(WorkerAgent): # Now using OMDb
                                 detail_data = detail_response.json()
                                 parsed_movie = self._parse_omdb_movie_data(detail_data)
                                 if parsed_movie:
+                                    print(f"--- [MovieDataWorker] Parsed Movie Data: ---\n{json.dumps(parsed_movie, indent=2)}")
                                     movies_data_list.append(parsed_movie)
                             else:
                                 print(f"--- [{self.get_name()}] Error fetching details for IMDb ID {movie_stub['imdbID']}: Status {detail_response.status_code} ---")
                 elif data.get("Error"):
-                    return {"movies": [], "message": f"OMDb: {data.get('Error')} for search term '{general_search_term}'."}
+                    result_dict = {"movies": [], "message": f"OMDb: {data.get('Error')} for search term '{general_search_term}'."}
+                    print(f"--- [MovieDataWorker] Returning message: {result_dict['message']} ---")
+                    return result_dict
             else:
-                return {"error": "MovieDataWorker: Movie title or general search term is required for OMDb."}
+                result_dict = {"error": "MovieDataWorker: Movie title or general search term is required for OMDb."}
+                print(f"--- [MovieDataWorker] Returning error: {result_dict['error']} ---")
+                return result_dict
 
             final_filtered_movies = []
             if movies_data_list:
@@ -146,17 +154,29 @@ class MovieDataWorker(WorkerAgent): # Now using OMDb
                     if passes_filter:
                         final_filtered_movies.append(movie)
             
-            if not final_filtered_movies and (movie_title_query or general_search_term) and movies_data_list: 
-                return {"movies": [], "message": "Found movies but none matched all filter criteria (year/gross)."}
+            if not final_filtered_movies and (movie_title_query or general_search_term) and movies_data_list:
+                result_dict = {"movies": [], "message": "Found movies but none matched all filter criteria (year/gross)."}
+                print(f"--- [MovieDataWorker] Returning message: {result_dict['message']} ---")
+                return result_dict
 
+            print(f"--- [MovieDataWorker] Returning {len(final_filtered_movies)} movies after filtering. ---")
+            if final_filtered_movies:
+                for movie in final_filtered_movies:
+                    print(f"    - Title: {movie.get('title')}, Year: {movie.get('year')}, IMDb: {movie.get('imdb_id')}")
             return {"movies": final_filtered_movies}
 
         except requests.exceptions.RequestException as e:
-            return {"error": f"OMDb API request error: {e}"} # This is the error you are seeing
+            result_dict = {"error": f"OMDb API request error: {e}"}
+            print(f"--- [MovieDataWorker] Returning error: {result_dict['error']} ---")
+            return result_dict
         except ValueError as e: 
-            return {"error": f"Error decoding OMDb API JSON response: {e}"}
+            result_dict = {"error": f"Error decoding OMDb API JSON response: {e}"}
+            print(f"--- [MovieDataWorker] Returning error: {result_dict['error']} ---")
+            return result_dict
         except Exception as e:
-            return {"error": f"Unexpected error in MovieDataWorker: {e}"}
+            result_dict = {"error": f"Unexpected error in MovieDataWorker: {e}"}
+            print(f"--- [MovieDataWorker] Returning error: {result_dict['error']} ---")
+            return result_dict
 
 # --- Other Workers (DataCalculationWorker, SummarizationWorker, GeneralSearchWorker, NewsSearchWorker) ---
 # These remain the same as the version where they were last fully defined.
@@ -166,10 +186,18 @@ class DataCalculationWorker(WorkerAgent):
     def execute(self, task_details: dict, previous_results: dict = None, conversation_history: list = None) -> dict:
         print(f"--- [{self.get_name()}] Executing: {task_details} ---")
         movies_data = task_details.get("movies_data", [])
-        if not movies_data: return {"average_score": None, "count": 0, "error": "No movie data."}
-        scores = [m.get("rotten_tomatoes_proxy") for m in movies_data if m.get("rotten_tomatoes_proxy") is not None]
-        if not scores: return {"average_score": None, "count": 0, "message": "No valid scores."}
-        return {"average_score": round(statistics.mean(scores), 1), "count": len(scores)}
+        result_dict = {}
+        if not movies_data:
+            result_dict = {"average_score": None, "count": 0, "error": "No movie data."}
+        else:
+            scores = [m.get("rotten_tomatoes_proxy") for m in movies_data if m.get("rotten_tomatoes_proxy") is not None]
+            if not scores:
+                result_dict = {"average_score": None, "count": 0, "message": "No valid scores."}
+            else:
+                result_dict = {"average_score": round(statistics.mean(scores), 1), "count": len(scores)}
+
+        print(f"--- [{self.get_name()}] Calculation Result: {json.dumps(result_dict, indent=2)} ---")
+        return result_dict
 
 class SummarizationWorker(WorkerAgent): 
     def get_description_for_llm(self) -> dict: return {"name":"summarizer", "description":"Summarizes text or movie overviews.", "parameters":{"type":"object", "properties":{"text_to_summarize":{"type":"string"}, "movies_data":{"type":"array", "items":{"type":"object", "properties":{"overview":{"type":"string"}}}}}}}
@@ -209,8 +237,19 @@ class NewsSearchWorker(WorkerAgent):
             "keanu reeves": [{"title": "Keanu Reeves Honored", "snippet": "Keanu received an award...", "source": "SimuNews", "date": "2025-05-30"}],
             "the matrix resurrections": [{"title": "Matrix Resurrections Themes", "snippet": "Critics discuss the narrative...", "source": "FilmBuff", "date": "2025-05-25"}]
         }
-        if search_term in mock_news_db: return {"news_articles": mock_news_db[search_term]}
-        return {"news_articles": [], "message": f"No recent news for '{task_details.get('search_term')}'."}
+        result_dict = {}
+        if search_term in mock_news_db:
+            result_dict = {"news_articles": mock_news_db[search_term]}
+            print(f"--- [{self.get_name()}] Found {len(result_dict['news_articles'])} news articles for '{search_term}'.")
+            for article in result_dict['news_articles']:
+                print(f"    - Title: {article.get('title')}, Source: {article.get('source')}")
+        else:
+            result_dict = {"news_articles": [], "message": f"No recent news for '{task_details.get('search_term')}'."}
+            print(f"--- [{self.get_name()}] No news articles found for '{search_term}'. Returning message: {result_dict.get('message', 'No message')} ---")
+
+        if 'error' in result_dict: # Should not happen with current mock_news_db logic
+             print(f"--- [{self.get_name()}] Returning error: {result_dict['error']} ---")
+        return result_dict
 
 class ResponseFormattingWorker(WorkerAgent):
     def get_description_for_llm(self) -> dict:
@@ -357,7 +396,8 @@ For 'final_response_ready', the 'action_input' should be for 'response_formatter
                                     }, "required": ["thought", "action", "is_final_step_for_now"] }
             }
         }
-        print(f"--- Sending OMDb-aware payload to Gemini (prompt length: {len(system_prompt)} chars) ---")
+        print(f"--- [LLM Input] Sending payload to Gemini (prompt length: {len(system_prompt)} chars) ---")
+        print(f"--- [LLM Input] System Prompt (first 500 chars):\n{system_prompt[:500]}... ---")
         try:
             # --- SIMULATED LLM RESPONSE FOR TESTING ---
             time.sleep(0.1) 
@@ -389,7 +429,7 @@ For 'final_response_ready', the 'action_input' should be for 'response_formatter
                     "thought": "Defaulting to format response with all available data.", "action": "final_response_ready", 
                     "action_input": { "original_prompt_details": agent_state_for_llm, **completed_results }, 
                     "is_final_step_for_now": True}
-            print(f"--- [Supervisor LLM Call] SIMULATED LLM JSON Response: {json.dumps(simulated_response_data, indent=2)} ---")
+            print(f"--- [LLM Output] SIMULATED LLM JSON Response: {json.dumps(simulated_response_data, indent=2)} ---")
             return simulated_response_data
         except Exception as e: print(f"--- [Supervisor LLM Call] Error: {e} ---")
         return None
@@ -417,7 +457,7 @@ For 'final_response_ready', the 'action_input' should be for 'response_formatter
         
         while self.current_agent_state["llm_call_count"] < self.max_llm_calls_per_request:
             self.current_agent_state["llm_call_count"] += 1
-            print(f"\n--- Supervisor LLM Cycle {self.current_agent_state['llm_call_count']} (OMDb) ---")
+            print(f"\n--- [LLM Cycle {self.current_agent_state['llm_call_count']}] Starting ---")
             
             # Pass current user_prompt for LLM to decide based on latest input and history
             llm_decision = await self._call_llm_for_plan(user_prompt, self.current_agent_state) 
@@ -426,9 +466,11 @@ For 'final_response_ready', the 'action_input' should be for 'response_formatter
                 final_response_str = "LLM communication error or invalid plan."; break
             
             print(f"--- [Supervisor LLM Decision]: Action='{llm_decision.get('action')}', Thought='{llm_decision.get('thought')}' ---")
+            action = llm_decision.get("action")
+            action_input = llm_decision.get("action_input", {})
+            print(f"    Action Input: {json.dumps(action_input, indent=2)}")
             self.conversation_history.append({"role": "noogle_supervisor_thought", "content": llm_decision.get('thought')})
             
-            action = llm_decision.get("action")
             action_input = llm_decision.get("action_input", {})
             is_final = llm_decision.get("is_final_step_for_now", False)
             observation = None
@@ -467,13 +509,21 @@ For 'final_response_ready', the 'action_input' should be for 'response_formatter
                     elif action == "calculator": output_key = "average_rt_result"
                     elif action == "summarizer": output_key = "summarized_movie_data"
                     elif action == "general_searcher": output_key = "general_search_result"
-                    elif action == "news_searcher": output_key = "news_search_result" 
+                    elif action == "news_searcher": output_key = "news_search_result"
                     
                     self.current_agent_state["completed_steps_results"][output_key] = observation
+
+                    # Enhanced logging for worker result
+                    if isinstance(observation, dict):
+                        print(f"--- [Worker Result - {action}] Observation: {json.dumps(observation, indent=2, default=str)[:300]}... ---")
+                    else:
+                        print(f"--- [Worker Result - {action}] Observation: {str(observation)[:300]}... ---")
+
                     self.conversation_history.append({"role": "noogle_worker_observation", "content": f"Tool: {action}, Result: {str(observation)[:150]}..."})
                     if observation.get("error"): print(f"--- [Supervisor] Worker '{action}' error: {observation['error']}. ---")
                 except Exception as e: 
                     observation = {"error": str(e)}
+                    print(f"--- [Supervisor] Worker '{action}' EXCEPTION: {str(e)}. ---") # Ensure this is visible
                     self.current_agent_state["completed_steps_results"][action + "_error"] = observation
             else: 
                 final_response_str = f"Unknown action from LLM: {action}."; is_final = True
